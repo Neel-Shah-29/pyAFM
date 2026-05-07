@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import re
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterable, List
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,6 +18,11 @@ FRAMEWORK_LABELS = {
     "feedback_only": "Feedback Only",
     "nl_hint_only": "NL Hint Only",
     "feedback_and_nl_hint": "Feedback + NL Hint",
+}
+FRAMEWORK_COLORS = {
+    "feedback_only": "#1f77b4",
+    "nl_hint_only": "#ff7f0e",
+    "feedback_and_nl_hint": "#2ca02c",
 }
 
 
@@ -53,18 +58,8 @@ def load_transactions(path: Path) -> pd.DataFrame:
     df["Student"] = df["Anon Student Id"].fillna("unknown_student").astype(str)
     df["Training Framework"] = df["Training Framework"].astype(str)
 
-    # Opportunity index within each (framework, student, KC) sequence.
     df["OppIndex"] = df.groupby(["Training Framework", "Student", "KC"], sort=False).cumcount()
     return df
-
-
-def build_kc_counts(df: pd.DataFrame) -> pd.DataFrame:
-    counts = (
-        df.groupby(["Training Framework", "KC", "OppIndex"], sort=False)
-        .agg(correct=("IsCorrect", "sum"), total=("IsCorrect", "size"))
-        .reset_index()
-    )
-    return counts
 
 
 def kc_curve_from_counts(kc_df: pd.DataFrame, opp_count_cutoff: int, opp_cutoff: int) -> np.ndarray:
@@ -84,46 +79,130 @@ def kc_curve_from_counts(kc_df: pd.DataFrame, opp_count_cutoff: int, opp_cutoff:
     if max_opp <= 0:
         return np.array([], dtype=float)
 
-    err_curve = 1.0 - (correct[:max_opp] / total[:max_opp])
-    return err_curve
+    return 1.0 - (correct[:max_opp] / total[:max_opp])
 
 
-def aggregate_curves(kc_curves: Dict[str, np.ndarray]) -> np.ndarray:
-    if not kc_curves:
-        return np.array([], dtype=float)
-    max_len = max(len(arr) for arr in kc_curves.values())
-    padded_curves = [np.pad(arr, (0, max_len - len(arr))) for arr in kc_curves.values()]
-    return np.sum(padded_curves, axis=0) / len(padded_curves)
+def _curve_iter(curves: Dict[str, np.ndarray] | Iterable[np.ndarray]) -> List[np.ndarray]:
+    if isinstance(curves, dict):
+        items = list(curves.values())
+    else:
+        items = list(curves)
+    return [np.asarray(curve, dtype=float) for curve in items if len(curve) > 0]
 
 
-def build_framework_curves(
-    counts: pd.DataFrame, opp_count_cutoff: int, opp_cutoff: int
-) -> Dict[str, Dict[str, np.ndarray]]:
-    framework_kc_curves: Dict[str, Dict[str, np.ndarray]] = {}
-    for framework in FRAMEWORK_ORDER:
-        fw_counts = counts[counts["Training Framework"] == framework]
+def _pad_curves(curves: Dict[str, np.ndarray] | Iterable[np.ndarray]) -> np.ndarray:
+    curve_list = _curve_iter(curves)
+    if not curve_list:
+        return np.empty((0, 0), dtype=float)
+    max_len = max(len(curve) for curve in curve_list)
+    padded = np.full((len(curve_list), max_len), np.nan, dtype=float)
+    for idx, curve in enumerate(curve_list):
+        padded[idx, : len(curve)] = curve
+    return padded
+
+
+def summarize_curve_collection(
+    curves: Dict[str, np.ndarray] | Iterable[np.ndarray],
+    monotonic_envelope: bool = False,
+) -> Dict[str, np.ndarray]:
+    padded = _pad_curves(curves)
+    if padded.size == 0:
+        empty = np.array([], dtype=float)
+        return {"mean": empty, "std": empty, "count": empty.astype(int)}
+
+    mean = np.nanmean(padded, axis=0)
+    std = np.nanstd(padded, axis=0)
+    count = np.sum(~np.isnan(padded), axis=0)
+
+    if monotonic_envelope and len(mean) > 0:
+        mean = np.minimum.accumulate(mean)
+
+    return {"mean": mean, "std": std, "count": count}
+
+
+def aggregate_curves(
+    kc_curves: Dict[str, np.ndarray] | Iterable[np.ndarray],
+    monotonic_envelope: bool = False,
+) -> np.ndarray:
+    return summarize_curve_collection(kc_curves, monotonic_envelope=monotonic_envelope)["mean"]
+
+
+def build_student_framework_kc_curves(
+    df: pd.DataFrame,
+    opp_count_cutoff: int,
+    opp_cutoff: int,
+) -> Dict[str, Dict[str, Dict[str, np.ndarray]]]:
+    counts = (
+        df.groupby(["Training Framework", "Student", "KC", "OppIndex"], sort=False)
+        .agg(correct=("IsCorrect", "sum"), total=("IsCorrect", "size"))
+        .reset_index()
+    )
+
+    framework_student_kc_curves: Dict[str, Dict[str, Dict[str, np.ndarray]]] = {
+        framework: {} for framework in FRAMEWORK_ORDER
+    }
+    for (framework, student), student_df in counts.groupby(["Training Framework", "Student"], sort=False):
         kc_curves: Dict[str, np.ndarray] = {}
-        for kc, kc_df in fw_counts.groupby("KC", sort=False):
+        for kc, kc_df in student_df.groupby("KC", sort=False):
             curve = kc_curve_from_counts(kc_df, opp_count_cutoff, opp_cutoff)
             if len(curve) > 0:
                 kc_curves[kc] = curve
-        framework_kc_curves[framework] = kc_curves
-    return framework_kc_curves
+        if kc_curves:
+            framework_student_kc_curves.setdefault(framework, {})[student] = kc_curves
+    return framework_student_kc_curves
 
 
-def plot_overall_curves(framework_kc_curves: Dict[str, Dict[str, np.ndarray]], out_path: Path) -> None:
-    plt.figure(figsize=(8, 5))
+def summarize_framework_curves(
+    framework_student_kc_curves: Dict[str, Dict[str, Dict[str, np.ndarray]]],
+    monotonic_envelope: bool = False,
+) -> Dict[str, Dict[str, np.ndarray]]:
+    summaries: Dict[str, Dict[str, np.ndarray]] = {}
     for framework in FRAMEWORK_ORDER:
-        agg_curve = aggregate_curves(framework_kc_curves.get(framework, {}))
-        if len(agg_curve) == 0:
+        student_curves = []
+        for kc_curves in framework_student_kc_curves.get(framework, {}).values():
+            curve = aggregate_curves(kc_curves, monotonic_envelope=monotonic_envelope)
+            if len(curve) > 0:
+                student_curves.append(curve)
+        summaries[framework] = summarize_curve_collection(
+            student_curves,
+            monotonic_envelope=monotonic_envelope,
+        )
+    return summaries
+
+
+def plot_overall_curves(
+    framework_student_kc_curves: Dict[str, Dict[str, Dict[str, np.ndarray]]],
+    out_path: Path,
+    monotonic_envelope: bool = False,
+) -> None:
+    plt.figure(figsize=(8, 5))
+    summaries = summarize_framework_curves(
+        framework_student_kc_curves,
+        monotonic_envelope=monotonic_envelope,
+    )
+    for framework in FRAMEWORK_ORDER:
+        summary = summaries.get(framework, {})
+        mean = summary.get("mean", np.array([], dtype=float))
+        std = summary.get("std", np.array([], dtype=float))
+        count = summary.get("count", np.array([], dtype=float))
+        if len(mean) == 0:
             continue
+
+        xs = np.arange(1, len(mean) + 1)
+        color = FRAMEWORK_COLORS.get(framework)
         plt.plot(
-            np.arange(1, len(agg_curve) + 1),
-            agg_curve,
+            xs,
+            mean,
             linewidth=2,
             marker="o",
+            color=color,
             label=FRAMEWORK_LABELS.get(framework, framework),
         )
+        if len(std) > 0 and np.nanmax(count) > 1:
+            stderr = np.divide(std, np.sqrt(np.maximum(count, 1)), where=count > 0)
+            lower = np.clip(mean - stderr, 0.0, 1.0)
+            upper = np.clip(mean + stderr, 0.0, 1.0)
+            plt.fill_between(xs, lower, upper, color=color, alpha=0.12)
 
     plt.grid(alpha=0.3)
     plt.title("Geometry Learning Curve (All Frameworks)", size=14)
@@ -138,9 +217,18 @@ def plot_overall_curves(framework_kc_curves: Dict[str, Dict[str, np.ndarray]], o
 
 
 def plot_per_hint_curves(
-    framework_kc_curves: Dict[str, Dict[str, np.ndarray]], out_dir: Path, require_all_frameworks: bool
+    framework_student_kc_curves: Dict[str, Dict[str, Dict[str, np.ndarray]]],
+    out_dir: Path,
+    require_all_frameworks: bool,
+    monotonic_envelope: bool = False,
 ) -> List[str]:
-    all_kc_sets = [set(framework_kc_curves.get(framework, {}).keys()) for framework in FRAMEWORK_ORDER]
+    all_kc_sets = []
+    for framework in FRAMEWORK_ORDER:
+        kc_names = set()
+        for kc_curves in framework_student_kc_curves.get(framework, {}).values():
+            kc_names.update(kc_curves.keys())
+        all_kc_sets.append(kc_names)
+
     if not all_kc_sets:
         return []
 
@@ -156,16 +244,33 @@ def plot_per_hint_curves(
         plt.figure(figsize=(8, 5))
         plotted = 0
         for framework in FRAMEWORK_ORDER:
-            curve = framework_kc_curves.get(framework, {}).get(kc)
-            if curve is None or len(curve) == 0:
+            student_curves = []
+            for kc_curves in framework_student_kc_curves.get(framework, {}).values():
+                curve = kc_curves.get(kc)
+                if curve is not None and len(curve) > 0:
+                    student_curves.append(curve)
+            if not student_curves:
                 continue
+
+            summary = summarize_curve_collection(student_curves, monotonic_envelope=monotonic_envelope)
+            mean = summary["mean"]
+            std = summary["std"]
+            count = summary["count"]
+            xs = np.arange(1, len(mean) + 1)
+            color = FRAMEWORK_COLORS.get(framework)
             plt.plot(
-                np.arange(1, len(curve) + 1),
-                curve,
+                xs,
+                mean,
                 linewidth=2,
                 marker="o",
+                color=color,
                 label=FRAMEWORK_LABELS.get(framework, framework),
             )
+            if len(std) > 0 and np.nanmax(count) > 1:
+                stderr = np.divide(std, np.sqrt(np.maximum(count, 1)), where=count > 0)
+                lower = np.clip(mean - stderr, 0.0, 1.0)
+                upper = np.clip(mean + stderr, 0.0, 1.0)
+                plt.fill_between(xs, lower, upper, color=color, alpha=0.12)
             plotted += 1
 
         if plotted == 0:
@@ -187,18 +292,36 @@ def plot_per_hint_curves(
     return written_hints
 
 
-def write_hint_curve_rows(framework_kc_curves: Dict[str, Dict[str, np.ndarray]], out_csv: Path) -> None:
+def write_hint_curve_rows(
+    framework_student_kc_curves: Dict[str, Dict[str, Dict[str, np.ndarray]]],
+    out_csv: Path,
+    monotonic_envelope: bool = False,
+) -> None:
     rows = []
     for framework in FRAMEWORK_ORDER:
-        kc_curves = framework_kc_curves.get(framework, {})
-        for kc, curve in kc_curves.items():
-            for opp_idx, err in enumerate(curve, start=1):
+        kc_names = sorted(
+            {
+                kc
+                for kc_curves in framework_student_kc_curves.get(framework, {}).values()
+                for kc in kc_curves.keys()
+            }
+        )
+        for kc in kc_names:
+            student_curves = []
+            for kc_curves in framework_student_kc_curves.get(framework, {}).values():
+                curve = kc_curves.get(kc)
+                if curve is not None and len(curve) > 0:
+                    student_curves.append(curve)
+            summary = summarize_curve_collection(student_curves, monotonic_envelope=monotonic_envelope)
+            for opp_idx, err in enumerate(summary["mean"], start=1):
                 rows.append(
                     {
                         "framework": framework,
                         "kc_field": kc,
                         "opportunity": opp_idx,
                         "error_rate": float(err),
+                        "stderr": float(summary["std"][opp_idx - 1] / np.sqrt(max(summary["count"][opp_idx - 1], 1))),
+                        "n_students": int(summary["count"][opp_idx - 1]),
                     }
                 )
     out_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -239,6 +362,11 @@ def main() -> None:
         action="store_true",
         help="If set, include hints that are present in any framework (not only common hints).",
     )
+    parser.add_argument(
+        "--monotonic-envelope",
+        action="store_true",
+        help="Plot a cumulative-min envelope so averaged error curves never increase.",
+    )
     args = parser.parse_args()
 
     aggregated_input = Path(args.aggregated_input).resolve()
@@ -247,16 +375,28 @@ def main() -> None:
     hint_curves_csv = Path(args.hint_curves_csv).resolve()
 
     df = load_transactions(aggregated_input)
-    counts = build_kc_counts(df)
-    framework_kc_curves = build_framework_curves(counts, args.opp_count_cutoff, args.opp_cutoff)
+    framework_student_kc_curves = build_student_framework_kc_curves(
+        df,
+        args.opp_count_cutoff,
+        args.opp_cutoff,
+    )
 
-    plot_overall_curves(framework_kc_curves, overall_plot)
+    plot_overall_curves(
+        framework_student_kc_curves,
+        overall_plot,
+        monotonic_envelope=args.monotonic_envelope,
+    )
     hints_written = plot_per_hint_curves(
-        framework_kc_curves,
+        framework_student_kc_curves,
         per_hint_dir,
         require_all_frameworks=not args.allow_missing_framework_hints,
+        monotonic_envelope=args.monotonic_envelope,
     )
-    write_hint_curve_rows(framework_kc_curves, hint_curves_csv)
+    write_hint_curve_rows(
+        framework_student_kc_curves,
+        hint_curves_csv,
+        monotonic_envelope=args.monotonic_envelope,
+    )
 
     print(f"Overall plot: {overall_plot}")
     print(f"Per-hint plots directory: {per_hint_dir}")
